@@ -15,6 +15,17 @@ def test_can_read_file_true_false():
     assert can_read_file(bad) is False
 
 
+def test_can_read_file_false_for_app_library():
+    class AppLibrary:
+        type = "app_library"
+
+        @property
+        def size(self):
+            raise KeyError("size")
+
+    assert can_read_file(AppLibrary()) is False
+
+
 def test_download_status_fields():
     ds = DownloadStatus(path="/tmp/foo", size=100, downloaded=50, checksum="abc", status="pending", changes=2, error="")
     assert ds.path == "/tmp/foo"

@@ -13,7 +13,7 @@ def can_read_file(item: Any) -> bool:
     try:
         return (
             hasattr(item, 'type') and
-            item.type != 'folder' and
+            item.type not in ('folder', 'app_library') and
             hasattr(item, 'size') and
             hasattr(item, 'open')
         )
