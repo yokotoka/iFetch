@@ -42,7 +42,7 @@ import re
 import threading
 import time
 import traceback
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -72,11 +72,14 @@ RECENTLY_DELETED_ALBUM = "Recently Deleted"
 
 _ILLEGAL_FILENAME_CHARS = re.compile(r'[\x00-\x1f<>:"/\\|?*]')
 _RETRY_AFTER_RE = re.compile(r"retry[-_ ]?after[\"'\s:=]+(\d+)", re.IGNORECASE)
+INDEX_SAVE_EVERY = 200
+
 _NON_RETRYABLE = (
     "unauthorized",
     "forbidden",
     "invalid credentials",
     "not activated",
+    "(410)",
 )
 
 
@@ -531,13 +534,16 @@ class PhotosDownloader:
     # ------------------------------------------------------------------
     # Planning
     # ------------------------------------------------------------------
-    def plan(
+    def plan(self, *args: Any, **kwargs: Any) -> List[AssetPlan]:
+        return list(self.iter_plans(*args, **kwargs))
+
+    def iter_plans(
         self,
         destination: Union[str, Path],
         album: Optional[str] = None,
         since: Optional[datetime] = None,
         until: Optional[datetime] = None,
-    ) -> List[AssetPlan]:
+    ) -> Iterator[AssetPlan]:
         """Decide, serially and deterministically, what each asset needs."""
         dest = Path(destination).resolve()
         if self.index is None or self.root_path != dest:
@@ -545,11 +551,10 @@ class PhotosDownloader:
             self.index = PhotosIndex.load(dest)
 
         claimed: Dict[str, str] = {}
-        plans: List[AssetPlan] = []
 
         for album_name, asset in self.iter_assets(album=album, since=since, until=until):
             try:
-                plans.append(self._plan_asset(asset, album_name, dest, claimed))
+                plan = self._plan_asset(asset, album_name, dest, claimed)
             except Exception as exc:  # one unreadable record must not abort planning
                 self.logger.error(
                     json.dumps(
@@ -560,7 +565,8 @@ class PhotosDownloader:
                         }
                     )
                 )
-        return plans
+                continue
+            yield plan
 
     def _plan_asset(
         self,
@@ -893,6 +899,15 @@ class PhotosDownloader:
             "details": [r.__dict__ for r in self.results],
         }
 
+    def _save_index(self) -> None:
+        try:
+            with self._results_lock:
+                self.index.save()
+        except OSError as exc:
+            self.logger.error(
+                json.dumps({"event": "index_save_failed", "error": str(exc)})
+            )
+
     # ------------------------------------------------------------------
     # Entry point
     # ------------------------------------------------------------------
@@ -931,11 +946,10 @@ class PhotosDownloader:
             )
         )
 
-        plans = self.plan(dest, album=album, since=since, until=until)
-        pending = [p for p in plans if p.needs_work]
-        skipped = len(plans) - len(pending)
-
         if self.dry_run:
+            plans = self.plan(dest, album=album, since=since, until=until)
+            pending = [p for p in plans if p.needs_work]
+            skipped = len(plans) - len(pending)
             for plan in pending:
                 self.logger.info(
                     json.dumps(
@@ -968,33 +982,45 @@ class PhotosDownloader:
             )
             return report
 
-        if pending:
-            with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
-                futures = {
-                    executor.submit(self._execute_plan, plan): plan for plan in pending
-                }
-                for future in as_completed(futures):
-                    try:
-                        future.result()
-                    except Exception as exc:  # defensive: _execute_plan swallows
-                        self.logger.error(
-                            json.dumps(
-                                {
-                                    "event": "future_exception",
-                                    "asset_id": futures[future].asset_id,
-                                    "error": str(exc),
-                                }
-                            )
+        planned = skipped = completed = 0
+        in_flight: Dict[Any, AssetPlan] = {}
+
+        def reap(done):
+            nonlocal completed
+            for future in done:
+                plan = in_flight.pop(future)
+                try:
+                    future.result()
+                except Exception as exc:  # defensive: _execute_plan swallows
+                    self.logger.error(
+                        json.dumps(
+                            {
+                                "event": "future_exception",
+                                "asset_id": plan.asset_id,
+                                "error": str(exc),
+                            }
                         )
+                    )
+                completed += 1
+                if completed % INDEX_SAVE_EVERY == 0:
+                    self._save_index()
 
         try:
-            self.index.save()
-        except OSError as exc:
-            self.logger.error(
-                json.dumps({"event": "index_save_failed", "error": str(exc)})
-            )
+            with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
+                for plan in self.iter_plans(dest, album=album, since=since, until=until):
+                    planned += 1
+                    if not plan.needs_work:
+                        skipped += 1
+                        continue
+                    if len(in_flight) >= 2 * self.max_workers:
+                        reap(wait(in_flight, return_when=FIRST_COMPLETED).done)
+                    in_flight[executor.submit(self._execute_plan, plan)] = plan
+                while in_flight:
+                    reap(wait(in_flight, return_when=FIRST_COMPLETED).done)
+        finally:
+            self._save_index()
 
-        report = self.generate_summary_report(skipped=skipped, planned=len(plans))
+        report = self.generate_summary_report(skipped=skipped, planned=planned)
         self.logger.info(
             json.dumps({"event": "photos_download_completed", "summary": report["summary"]})
         )

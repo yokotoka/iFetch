@@ -745,3 +745,62 @@ def test_email_required(monkeypatch):
     monkeypatch.delenv("ICLOUD_EMAIL", raising=False)
     with pytest.raises(ValueError):
         PhotosDownloader()
+
+
+# ---------------------------------------------------------------------------
+# Streaming plan -> execute, expired URLs
+# ---------------------------------------------------------------------------
+def test_downloads_start_before_enumeration_finishes(tmp_path):
+    assets = [FakeAsset(f"a{i}", f"{i}.jpg", dt(2024, 1, 2)) for i in range(50)]
+    dl = make_downloader(FakeAPI(None), folder_structure="flat", max_workers=2)
+    executed_when_yielded = []
+    original_execute = dl._execute_plan
+    executed = []
+
+    def counting_execute(plan):
+        executed.append(plan.asset_id)
+        return original_execute(plan)
+
+    def slow_iter_assets(**_kwargs):
+        for asset in assets:
+            executed_when_yielded.append(len(executed))
+            yield "Library", asset
+
+    dl._execute_plan = counting_execute
+    dl.iter_assets = slow_iter_assets
+
+    report = dl.download(destination=tmp_path)
+
+    assert executed_when_yielded[-1] > 0
+    assert report["summary"]["downloaded"] == 50
+
+
+def test_expired_url_410_is_not_retried():
+    dl = make_downloader(FakeAPI(None), max_retries=3)
+    calls = []
+
+    def expired():
+        calls.append(1)
+        raise RuntimeError("Apple no longer serves https://x (410)")
+
+    with pytest.raises(Exception):
+        dl._with_retry(expired, "asset")
+
+    assert len(calls) == 1
+
+
+def test_index_saved_when_enumeration_fails(tmp_path):
+    assets = [FakeAsset(f"a{i}", f"{i}.jpg", dt(2024, 1, 2)) for i in range(3)]
+    dl = make_downloader(FakeAPI(None), folder_structure="flat", max_workers=2)
+
+    def failing_iter_assets(**_kwargs):
+        yield from (("Library", asset) for asset in assets)
+        raise RuntimeError("Photos service not available")
+
+    dl.iter_assets = failing_iter_assets
+
+    with pytest.raises(RuntimeError):
+        dl.download(destination=tmp_path)
+
+    index = PhotosIndex.load(tmp_path)
+    assert all(index.get(asset.id) for asset in assets)
