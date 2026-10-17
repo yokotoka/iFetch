@@ -79,8 +79,13 @@ _NON_RETRYABLE = (
     "forbidden",
     "invalid credentials",
     "not activated",
-    "(410)",
 )
+
+#: Apple's signed download URLs die ~15 minutes after the record was fetched.
+URL_MAX_AGE_SECONDS = 600
+
+#: ``(connect, read)`` timeouts for every download request.
+DOWNLOAD_TIMEOUT = (30, 120)
 
 
 # ---------------------------------------------------------------------------
@@ -141,6 +146,7 @@ class AssetPlan:
     skipped: bool = False
     skip_reason: str = ""
     album: str = ""
+    fetched_at: float = field(default_factory=time.monotonic)
 
     @property
     def needs_work(self) -> bool:
@@ -702,43 +708,65 @@ class PhotosDownloader:
             f"Failed after {self.max_retries} attempts ({description}): {last_error}"
         )
 
-    def _write_payload(self, payload: Any, path: Path) -> int:
-        """Persist a pyicloud download result (bytes or streaming Response)."""
+    def _stream_to_file(self, url: str, path: Path) -> int:
+        """Stream ``url`` into ``<path>.part`` (resuming it) and rename."""
         path.parent.mkdir(parents=True, exist_ok=True)
-        temp_path = path.with_suffix(path.suffix + ".part")
-        written = 0
+        part = path.with_suffix(path.suffix + ".part")
+        offset = part.stat().st_size if part.exists() else 0
+        session = getattr(self.photos_service, "session", None) or self._auth_manager.http
+        kwargs = {"headers": {"Range": f"bytes={offset}-"}} if offset else {}
+        response = session.get(url, stream=True, timeout=DOWNLOAD_TIMEOUT, **kwargs)
+        if response.status_code == 416:
+            part.unlink()
+        response.raise_for_status()
+        mode = "ab" if offset and response.status_code == 206 else "wb"
+        with part.open(mode) as handle:
+            for chunk in response.iter_content(1 << 20):
+                handle.write(chunk)
+        part.replace(path)
+        return path.stat().st_size
 
-        if payload is None:
-            raise Exception("iCloud returned no data for this version")
+    @staticmethod
+    def _refreshed_asset(asset: Any) -> Any:
+        """Re-fetch the asset's CloudKit records for fresh download URLs."""
+        library = getattr(asset, "_library", None)
+        client = getattr(library, "_client", None)
+        zone_id = getattr(library, "zone_id", None)
+        rebuild = getattr(library, "_asset_from_uploaded_records", None)
+        if not (client and zone_id and rebuild):
+            return asset
+        try:
+            from pyicloud.services.photos_cloudkit.client import CKZoneIDReq
+        except ImportError:
+            return asset
+        lookup = client.lookup(
+            record_names=[asset.master_id, asset.id], zone_id=CKZoneIDReq(**zone_id)
+        )
+        return rebuild(lookup.records) or asset
 
-        if isinstance(payload, (bytes, bytearray)):
-            with temp_path.open("wb") as handle:
-                handle.write(payload)
-            written = len(payload)
-        elif hasattr(payload, "iter_content"):
-            raise_for_status = getattr(payload, "raise_for_status", None)
-            if callable(raise_for_status):
-                raise_for_status()
-            with temp_path.open("wb") as handle:
-                for chunk in payload.iter_content(chunk_size=1024 * 1024):
-                    if chunk:
-                        handle.write(chunk)
-                        written += len(chunk)
-        elif hasattr(payload, "content"):
-            data = payload.content
-            with temp_path.open("wb") as handle:
-                handle.write(data)
-            written = len(data)
-        elif hasattr(payload, "read"):
-            data = payload.read()
-            with temp_path.open("wb") as handle:
-                handle.write(data)
-            written = len(data)
-        else:
-            raise Exception(f"Unsupported download payload: {type(payload)!r}")
+    @staticmethod
+    def _asset_url(asset: Any, version: str) -> Optional[str]:
+        getter = getattr(asset, "download_url", None)
+        if callable(getter):
+            return getter(version)
+        return asset.versions[version]["url"]
 
-        temp_path.replace(path)
-        return written
+    def _download_url(self, plan: AssetPlan, path: Path, url_for, description: str) -> int:
+        tries = 0
+
+        def attempt() -> int:
+            nonlocal tries
+            stale = time.monotonic() - plan.fetched_at > URL_MAX_AGE_SECONDS
+            if tries or stale:
+                plan.asset = self._refreshed_asset(plan.asset)
+                plan.fetched_at = time.monotonic()
+            tries += 1
+            url = url_for(plan.asset)
+            if not url:
+                raise Exception("iCloud returned no data for this version")
+            return self._stream_to_file(url, path)
+
+        return self._with_retry(attempt, description)
 
     def _apply_mtime(self, path: Path, created: Optional[datetime]) -> None:
         if not (self.set_mtime and created):
@@ -749,29 +777,23 @@ class PhotosDownloader:
         except Exception:
             pass  # non-fatal; the bytes matter more than the timestamp
 
-    def _download_version(self, asset: Any, version: str, path: Path) -> int:
-        payload = self._with_retry(
-            lambda: asset.download(version=version), f"{path.name} ({version})"
+    def _download_version(self, plan: AssetPlan, version: str, path: Path) -> int:
+        return self._download_url(
+            plan, path, lambda asset: self._asset_url(asset, version), f"{path.name} ({version})"
         )
-        return self._write_payload(payload, path)
 
     def _download_live(self, plan: AssetPlan) -> int:
         """Fetch the video half of a Live Photo."""
-        asset = plan.asset
-        versions = self._asset_versions(asset)
-        if plan.live_version in versions:
-            return self._download_version(asset, plan.live_version, plan.live_path)
+        if plan.live_version in self._asset_versions(plan.asset):
+            return self._download_version(plan, plan.live_version, plan.live_path)
 
         # pyicloud 2.0.x: the paired video is not a known version, so hit the
         # CloudKit downloadURL directly using the authenticated session.
-        url = plan.live_url
-        if not url:
+        if not plan.live_url:
             raise Exception("Live Photo video component has no download URL")
-        session = getattr(self.photos_service, "session", None) or self._auth_manager.http
-        payload = self._with_retry(
-            lambda: session.get(url, stream=True), f"{plan.live_path.name} (live)"
+        return self._download_url(
+            plan, plan.live_path, lambda _asset: plan.live_url, f"{plan.live_path.name} (live)"
         )
-        return self._write_payload(payload, plan.live_path)
 
     # ------------------------------------------------------------------
     # Execution
@@ -786,7 +808,7 @@ class PhotosDownloader:
         try:
             if plan.need_photo:
                 downloaded += self._download_version(
-                    plan.asset, plan.version, plan.local_path
+                    plan, plan.version, plan.local_path
                 )
                 self._apply_mtime(plan.local_path, plan.created)
 

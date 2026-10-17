@@ -52,6 +52,23 @@ from .packages import (
 )
 
 
+DEFAULT_REQUEST_TIMEOUT = 30
+
+
+def _default_request_timeout(session: Any) -> None:
+    """Make requests that name no timeout (pyicloud's own calls) time out."""
+    if session is None:
+        return
+    request = session.request
+
+    def request_with_timeout(*args: Any, **kwargs: Any) -> Any:
+        if kwargs.get("timeout") is None:
+            kwargs["timeout"] = DEFAULT_REQUEST_TIMEOUT
+        return request(*args, **kwargs)
+
+    session.request = request_with_timeout
+
+
 def remote_metadata(item: Any) -> Tuple[Optional[int], Optional[str]]:
     """Extract (size, modified-token) from a pyicloud DriveNode without I/O.
 
@@ -525,6 +542,7 @@ class DownloadManager:
             params.update(region_service_kwargs(self.region))
 
             self.api = PyiCloudService(**params)
+            _default_request_timeout(getattr(self.api, "session", None))
 
             if self.api.requires_2fa:
                 print("\nTwo-factor authentication required.")
@@ -899,6 +917,7 @@ class DownloadManager:
                 resp = drive.session.get(
                     drive._document_root + f"/ws/{zone}/download/by_id",
                     params=file_params,
+                    timeout=DEFAULT_REQUEST_TIMEOUT,
                 )
                 if not getattr(resp, "ok", False):
                     note("by_id_with_share", "rejected",
@@ -910,7 +929,10 @@ class DownloadManager:
                     token = data_token or package_token
                     if token and token.get("url"):
                         return drive.session.get(
-                            token["url"], params=drive.params, stream=True
+                            token["url"],
+                            params=drive.params,
+                            stream=True,
+                            timeout=DEFAULT_REQUEST_TIMEOUT,
                         )
                     note("by_id_with_share", "no_url",
                          "response carried neither data_token.url nor package_token.url")

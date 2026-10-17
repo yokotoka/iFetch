@@ -35,9 +35,9 @@ from ifetch.photos import (  # noqa: E402
 class FakeResponse:
     """Mimics the streaming Response returned by pyicloud 2.0.x."""
 
-    def __init__(self, data: bytes):
+    def __init__(self, data: bytes, status_code: int = 200):
         self._data = data
-        self.status_code = 200
+        self.status_code = status_code
 
     def raise_for_status(self):
         return None
@@ -60,7 +60,6 @@ class FakeAsset:
         live_key="original_video",
         raise_times=0,
         error=None,
-        as_bytes=True,
         legacy_live=False,
     ):
         self.id = asset_id
@@ -72,8 +71,7 @@ class FakeAsset:
         self.download_calls = []
         self._raise_times = raise_times
         self._error = error or RuntimeError("transient failure")
-        self._as_bytes = as_bytes
-
+        self.urls = {}
         self.versions = {
             "original": {
                 "filename": filename,
@@ -89,6 +87,8 @@ class FakeAsset:
             },
         }
         self._live_data = live_data
+        for info in self.versions.values():
+            self.urls[info["url"]] = data
         if live_data is not None and not legacy_live:
             self.versions[live_key] = {
                 "filename": Path(filename).stem + ".MOV",
@@ -96,9 +96,11 @@ class FakeAsset:
                 "size": len(live_data),
                 "type": "com.apple.quicktime-movie",
             }
+            self.urls[self.versions[live_key]["url"]] = live_data
         if live_data is not None and legacy_live:
             # pyicloud 2.0.x shape: the Live Photo video only exists as a raw
             # CloudKit field on the master record.
+            self.urls[f"https://example.invalid/{asset_id}/legacy-live"] = live_data
             self._master_record = {
                 "fields": {
                     "resOriginalVidComplRes": {
@@ -110,15 +112,12 @@ class FakeAsset:
                 }
             }
 
-    def download(self, version="original", **kwargs):
+    def download_url(self, version="original"):
         self.download_calls.append(version)
         if self._raise_times > 0:
             self._raise_times -= 1
             raise self._error
-        payload = self._live_data if version.endswith("_video") else self._data
-        if payload is None:
-            return None
-        return payload if self._as_bytes else FakeResponse(payload)
+        return self.versions[version]["url"]
 
 
 class FakeAlbum:
@@ -179,11 +178,25 @@ class LegacyAlbumContainer:
         return self._albums[key]
 
 
+class FakeSession:
+    """Serves each asset's URLs and records every GET call."""
+
+    def __init__(self, payloads):
+        self.payloads = payloads
+        self.calls = []
+
+    def get(self, url, **kwargs):
+        self.calls.append((url, kwargs))
+        return FakeResponse(self.payloads[url])
+
+
 class FakePhotosService:
     def __init__(self, albums, container_cls=ModernAlbumContainer, all_album=None):
         self.albums = container_cls(albums)
         self._all = all_album if all_album is not None else albums[0]
-        self.session = None
+        self.session = FakeSession(
+            {u: d for a in albums for x in a._assets for u, d in x.urls.items()}
+        )
 
     @property
     def all(self):
@@ -344,17 +357,6 @@ def test_download_originals_flat(tmp_path):
     assert report["summary"]["downloaded"] == 1
     assert report["summary"]["failed"] == 0
     assert (tmp_path / REPORT_FILENAME).exists()
-
-
-def test_download_handles_streaming_response_payload(tmp_path):
-    """pyicloud 2.0.x returns a streaming Response instead of bytes."""
-    asset = FakeAsset("a1", "one.jpg", dt(2024, 1, 2), data=b"stream", as_bytes=False)
-    api = FakeAPI(FakePhotosService([FakeAlbum("Library", [asset])]))
-    dl = make_downloader(api, folder_structure="flat")
-
-    dl.download(destination=tmp_path)
-
-    assert (tmp_path / "one.jpg").read_bytes() == b"stream"
 
 
 def test_date_based_folder_structure(tmp_path):
@@ -752,7 +754,11 @@ def test_email_required(monkeypatch):
 # ---------------------------------------------------------------------------
 def test_downloads_start_before_enumeration_finishes(tmp_path):
     assets = [FakeAsset(f"a{i}", f"{i}.jpg", dt(2024, 1, 2)) for i in range(50)]
-    dl = make_downloader(FakeAPI(None), folder_structure="flat", max_workers=2)
+    dl = make_downloader(
+        FakeAPI(FakePhotosService([FakeAlbum("Library", assets)])),
+        folder_structure="flat",
+        max_workers=2,
+    )
     executed_when_yielded = []
     original_execute = dl._execute_plan
     executed = []
@@ -775,7 +781,7 @@ def test_downloads_start_before_enumeration_finishes(tmp_path):
     assert report["summary"]["downloaded"] == 50
 
 
-def test_expired_url_410_is_not_retried():
+def test_expired_url_410_is_retried():
     dl = make_downloader(FakeAPI(None), max_retries=3)
     calls = []
 
@@ -786,12 +792,16 @@ def test_expired_url_410_is_not_retried():
     with pytest.raises(Exception):
         dl._with_retry(expired, "asset")
 
-    assert len(calls) == 1
+    assert len(calls) == 3
 
 
 def test_index_saved_when_enumeration_fails(tmp_path):
     assets = [FakeAsset(f"a{i}", f"{i}.jpg", dt(2024, 1, 2)) for i in range(3)]
-    dl = make_downloader(FakeAPI(None), folder_structure="flat", max_workers=2)
+    dl = make_downloader(
+        FakeAPI(FakePhotosService([FakeAlbum("Library", assets)])),
+        folder_structure="flat",
+        max_workers=2,
+    )
 
     def failing_iter_assets(**_kwargs):
         yield from (("Library", asset) for asset in assets)
@@ -804,3 +814,133 @@ def test_index_saved_when_enumeration_fails(tmp_path):
 
     index = PhotosIndex.load(tmp_path)
     assert all(index.get(asset.id) for asset in assets)
+
+
+# ---------------------------------------------------------------------------
+# Streaming, resume and URL refresh
+# ---------------------------------------------------------------------------
+class ScriptedSession:
+    """Answers GETs from a queue of (status, chunks, error_after_chunks)."""
+
+    def __init__(self, script):
+        self.script = list(script)
+        self.calls = []
+
+    def get(self, url, **kwargs):
+        self.calls.append((url, kwargs))
+        status, chunks, fail = self.script.pop(0)
+        if status >= 400:
+            raise RuntimeError(f"Apple no longer serves {url} ({status})")
+        return ChunkedResponse(status, chunks, fail)
+
+
+class ChunkedResponse:
+    def __init__(self, status, chunks, fail):
+        self.status_code = status
+        self._chunks = chunks
+        self._fail = fail
+
+    def raise_for_status(self):
+        return None
+
+    def iter_content(self, chunk_size):
+        self.chunk_size = chunk_size
+        yield from self._chunks
+        if self._fail:
+            raise ConnectionError("Request failed to iCloud")
+
+
+def one_asset_downloader(tmp_path, session, asset=None, **kwargs):
+    asset = asset or FakeAsset("a1", "big.mov", dt(2024, 1, 2), data=b"x")
+    service = FakePhotosService([FakeAlbum("Library", [asset])])
+    service.session = session
+    return make_downloader(FakeAPI(service), folder_structure="flat", max_retries=3, **kwargs)
+
+
+def test_download_streams_chunks_to_part_then_renames(tmp_path):
+    session = ScriptedSession([(200, [b"aaa", b"bbb", b"ccc"], False)])
+    dl = one_asset_downloader(tmp_path, session)
+
+    dl.download(destination=tmp_path)
+
+    assert (tmp_path / "big.mov").read_bytes() == b"aaabbbccc"
+    assert not list(tmp_path.glob("*.part"))
+
+
+def test_every_get_carries_a_timeout(tmp_path):
+    session = ScriptedSession([(200, [b"a"], False)])
+    dl = one_asset_downloader(tmp_path, session)
+
+    dl.download(destination=tmp_path)
+
+    assert session.calls and all("timeout" in kw for _, kw in session.calls)
+
+
+def test_retry_resumes_with_range_header(tmp_path):
+    session = ScriptedSession([(200, [b"aaaa"], True), (206, [b"bbbb"], False)])
+    dl = one_asset_downloader(tmp_path, session)
+
+    report = dl.download(destination=tmp_path)
+
+    assert session.calls[0][1].get("headers") is None
+    assert session.calls[1][1]["headers"] == {"Range": "bytes=4-"}
+    assert (tmp_path / "big.mov").read_bytes() == b"aaaabbbb"
+    assert report["summary"]["failed"] == 0
+
+
+def test_retry_restarts_when_server_ignores_range(tmp_path):
+    session = ScriptedSession([(200, [b"aaaa"], True), (200, [b"aaaabbbb"], False)])
+    dl = one_asset_downloader(tmp_path, session)
+
+    dl.download(destination=tmp_path)
+
+    assert (tmp_path / "big.mov").read_bytes() == b"aaaabbbb"
+
+
+class FakeLibrary:
+    def __init__(self, fresh_asset):
+        self.zone_id = {"zoneName": "PrimarySync"}
+        self.lookups = []
+        self._fresh = fresh_asset
+        self._client = self
+
+    def lookup(self, record_names, zone_id):
+        self.lookups.append((record_names, zone_id))
+        return type("Lookup", (), {"records": ["rec"]})()
+
+    def _asset_from_uploaded_records(self, records):
+        return self._fresh
+
+
+def test_retry_uses_url_from_refreshed_records(tmp_path):
+    stale = FakeAsset("a1", "big.mov", dt(2024, 1, 2), data=b"x")
+    fresh = FakeAsset("a1", "big.mov", dt(2024, 1, 2), data=b"x")
+    fresh.versions["original"]["url"] = "https://example.invalid/fresh"
+    stale.master_id = "m1"
+    stale._library = FakeLibrary(fresh)
+    session = ScriptedSession([(410, [], False), (200, [b"ok"], False)])
+    dl = one_asset_downloader(tmp_path, session, asset=stale)
+
+    report = dl.download(destination=tmp_path)
+
+    assert [url for url, _ in session.calls] == [
+        "https://example.invalid/a1/original",
+        "https://example.invalid/fresh",
+    ]
+    assert stale._library.lookups[0][0] == ["m1", "a1"]
+    assert report["summary"]["failed"] == 0
+
+
+def test_stale_url_is_refreshed_before_first_attempt(tmp_path, monkeypatch):
+    stale = FakeAsset("a1", "big.mov", dt(2024, 1, 2), data=b"x")
+    fresh = FakeAsset("a1", "big.mov", dt(2024, 1, 2), data=b"x")
+    fresh.versions["original"]["url"] = "https://example.invalid/fresh"
+    stale.master_id = "m1"
+    stale._library = FakeLibrary(fresh)
+    session = ScriptedSession([(200, [b"ok"], False)])
+    dl = one_asset_downloader(tmp_path, session, asset=stale)
+    monkeypatch.setattr("ifetch.photos.URL_MAX_AGE_SECONDS", -1)
+
+    dl.download(destination=tmp_path)
+
+    assert session.calls[0][0] == "https://example.invalid/fresh"

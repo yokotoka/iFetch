@@ -242,6 +242,17 @@ class TestTrySharedOpenStrategy1:
         result = dm._try_shared_open(_SharedFileItemWithShareID())
         assert result is cdn
 
+    def test_every_session_get_carries_a_timeout(self):
+        dm = _make_dm()
+        token_r = _token_resp("https://cdn.icloud.com/a.jxl")
+        dm.api.drive = self._drive_with_session([token_r, _content_resp()])
+
+        dm._try_shared_open(_SharedFileItemWithShareID())
+
+        calls = dm.api.drive.session.get.call_args_list
+        assert len(calls) == 2
+        assert all(c[1].get("timeout") for c in calls)
+
     def test_includes_share_id_and_document_id_in_params(self):
         dm = _make_dm()
         cdn = _content_resp()
@@ -889,3 +900,27 @@ class TestDownloadDriveItemErrorHint:
         failed = [e for e in events if e.get("event") == "download_failed"]
         assert failed
         assert "hint" not in failed[0]
+
+
+class TestAuthenticateDefaultTimeout:
+    def test_session_requests_without_timeout_get_a_default(self, monkeypatch):
+        seen = []
+
+        class _Session:
+            def request(self, method, url, timeout=None, **kwargs):
+                seen.append(timeout)
+
+        class _Svc:
+            requires_2fa = requires_2sa = False
+
+            def __init__(self, **kw):
+                self.session = _Session()
+
+        monkeypatch.setattr("ifetch.downloader.PyiCloudService", _Svc)
+        dm = DownloadManager(email="me@example.com")
+        dm.authenticate()
+
+        dm.api.session.request("GET", "https://x")
+        dm.api.session.request("GET", "https://x", timeout=5)
+
+        assert seen == [30, 5]
