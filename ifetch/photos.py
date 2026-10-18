@@ -731,7 +731,7 @@ class PhotosDownloader:
                 if not self._is_retryable(exc) or attempt >= self.max_retries - 1:
                     break
                 delay = self._retry_after_seconds(exc)
-                wait = min(delay, 60) if delay is not None else 2 ** (attempt + 1)
+                wait = min(delay if delay is not None else 2 ** (attempt + 1), 60)
                 self.logger.warning(
                     json.dumps(
                         {
