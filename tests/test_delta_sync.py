@@ -110,6 +110,19 @@ def test_remote_metadata_falls_back_to_raw_data_dict():
     assert token == "dateModified=2026-01-02T03:04:05Z"
 
 
+def test_remote_metadata_reads_zero_size_from_listing_when_attribute_is_none():
+    class Empty:
+        size = None
+        data = {"size": 0}
+        date_modified = MTIME_A
+
+    class NoSize(Empty):
+        data = {}
+
+    assert remote_metadata(Empty()) == (0, "date_modified=" + MTIME_A.isoformat())
+    assert remote_metadata(NoSize()) == (None, "date_modified=" + MTIME_A.isoformat())
+
+
 def test_remote_metadata_returns_none_when_absent():
     node = NoMetadataNode("a.bin")
     size, token = remote_metadata(node)
