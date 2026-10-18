@@ -87,6 +87,10 @@ def remote_metadata(item: Any) -> Tuple[Optional[int], Optional[str]]:
     size: Optional[int] = None
     try:
         raw_size = getattr(item, 'size', None)
+        if raw_size is None:
+            # pyicloud maps a listed size of 0 to None; read the raw listing.
+            data = getattr(item, 'data', None)
+            raw_size = data.get('size') if isinstance(data, dict) else None
         if isinstance(raw_size, bool):
             raw_size = None
         if raw_size is not None:
