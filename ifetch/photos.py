@@ -48,6 +48,9 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, Iterator, List, Optional, Tuple, Union
 
+from pyicloud.services.photos_cloudkit.mappers import record_field_value
+from pyicloud.services.photos_cloudkit.service import PhotoAsset
+
 from .downloader import DownloadManager
 from .logger import setup_logging
 from .models import DownloadStatus
@@ -142,6 +145,8 @@ class AssetPlan:
     live_path: Optional[Path] = None
     live_version: Optional[str] = None
     live_url: Optional[str] = None
+    edited_path: Optional[Path] = None
+    edited_url: Optional[str] = None
     need_photo: bool = True
     skipped: bool = False
     skip_reason: str = ""
@@ -150,7 +155,7 @@ class AssetPlan:
 
     @property
     def needs_work(self) -> bool:
-        return self.need_photo or self.live_path is not None
+        return self.need_photo or self.live_path is not None or self.edited_path is not None
 
 
 @dataclass
@@ -473,6 +478,24 @@ class PhotosDownloader:
                     return "original_video", url, None
         return None, None, None
 
+    def _edited_component(self, asset: Any) -> Tuple[Optional[str], Optional[str]]:
+        """Return ``(url, extension)`` for the edited render, if the asset has one.
+
+        pyicloud does not expose edits in ``versions``; they are the
+        ``resJPEGFull`` (photo) or ``resVidFull`` (video) fields of the raw
+        asset record, present only on assets edited in Photos.
+        """
+        record = getattr(asset, "asset_record", None)
+        if record is None:
+            return None, None
+        original_type = (self._asset_versions(asset).get("original") or {}).get("type")
+        prefix = "resVidFull" if PhotoAsset.ITEM_TYPES.get(original_type) == "movie" else "resJPEGFull"
+        token = record_field_value(record, prefix + "Res")
+        url = token.get("downloadURL") if isinstance(token, dict) else getattr(token, "downloadURL", None)
+        if not url:
+            return None, None
+        return url, PhotoAsset.FILE_TYPE_EXTENSIONS.get(record_field_value(record, prefix + "FileType"))
+
     @staticmethod
     def _live_filename(photo_name: str, version_filename: Optional[str]) -> str:
         if version_filename and Path(version_filename).suffix:
@@ -633,6 +656,19 @@ class PhotosDownloader:
                 plan.live_version = live_version
                 plan.live_url = live_url
 
+        edited_url, edited_ext = self._edited_component(asset)
+        if edited_url:
+            edited_candidate = local_path.with_name(
+                local_path.stem + "_edited" + (edited_ext or local_path.suffix)
+            )
+            owned_edited = None
+            if entry and entry.get("edited_path"):
+                owned_edited = str(destination / entry["edited_path"])
+            plan.edited_path = self._claim_path(
+                claimed, edited_candidate, asset_id + ":edited", owned_edited
+            )
+            plan.edited_url = edited_url
+
         # Skip decision -------------------------------------------------
         if entry and entry.get("version") == version:
             recorded = destination / entry.get("path", "")
@@ -649,7 +685,11 @@ class PhotosDownloader:
                     if live_recorded and (destination / live_recorded).exists():
                         plan.live_path = None
                         plan.live_version = None
-                if plan.live_path is None:
+                if plan.edited_path is not None:
+                    edited_recorded = entry.get("edited_path")
+                    if edited_recorded and (destination / edited_recorded).exists():
+                        plan.edited_path = None
+                if plan.live_path is None and plan.edited_path is None:
                     plan.skipped = True
                     plan.skip_reason = "already_downloaded"
 
@@ -792,7 +832,19 @@ class PhotosDownloader:
         if not plan.live_url:
             raise Exception("Live Photo video component has no download URL")
         return self._download_url(
-            plan, plan.live_path, lambda _asset: plan.live_url, f"{plan.live_path.name} (live)"
+            plan,
+            plan.live_path,
+            lambda asset: self._live_component(asset)[1] or plan.live_url,
+            f"{plan.live_path.name} (live)",
+        )
+
+    def _download_edited(self, plan: AssetPlan) -> int:
+        """Fetch the edited render of an asset."""
+        return self._download_url(
+            plan,
+            plan.edited_path,
+            lambda asset: self._edited_component(asset)[0] or plan.edited_url,
+            f"{plan.edited_path.name} (edited)",
         )
 
     # ------------------------------------------------------------------
@@ -816,6 +868,10 @@ class PhotosDownloader:
                 downloaded += self._download_live(plan)
                 self._apply_mtime(plan.live_path, plan.created)
 
+            if plan.edited_path is not None:
+                downloaded += self._download_edited(plan)
+                self._apply_mtime(plan.edited_path, plan.created)
+
             self._record(
                 DownloadStatus(
                     path=str(plan.local_path),
@@ -832,6 +888,7 @@ class PhotosDownloader:
                         "path": str(plan.local_path),
                         "version": plan.version,
                         "live_path": str(plan.live_path) if plan.live_path else None,
+                        "edited_path": str(plan.edited_path) if plan.edited_path else None,
                         "bytes": downloaded,
                     }
                 )
@@ -888,13 +945,12 @@ class PhotosDownloader:
             "album": plan.album,
             "downloaded_at": datetime.now(timezone.utc).isoformat(),
         }
-        live_path = plan.live_path or (
-            self.root_path / existing["live_path"]
-            if existing.get("live_path") and self.root_path
-            else None
-        )
-        if live_path is not None:
-            entry["live_path"] = self._relative(Path(live_path))
+        for key, planned in (("live_path", plan.live_path), ("edited_path", plan.edited_path)):
+            recorded = planned or (
+                self.root_path / existing[key] if existing.get(key) and self.root_path else None
+            )
+            if recorded is not None:
+                entry[key] = self._relative(Path(recorded))
         with self._results_lock:
             self.index.record(plan.asset_id, entry)
 
