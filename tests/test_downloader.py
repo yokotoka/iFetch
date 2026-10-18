@@ -5,7 +5,7 @@ import pytest
 
 sys.path.append(str(Path(__file__).resolve().parents[1]))
 
-from ifetch.downloader import DownloadManager  # noqa: E402
+from ifetch.downloader import MAX_RANGE_BYTES, DownloadManager  # noqa: E402
 
 
 class _FakeResp:
@@ -49,3 +49,16 @@ def test_merge_ranges_coalesces_adjacent_segments():
     merged = dm._merge_ranges([(5, 9), (0, 4), (12, 14), (10, 11)])
 
     assert merged == [(0, 14)]
+
+
+def test_merge_ranges_bounds_range_length():
+    dm = DownloadManager(email="user@example.com")
+    mib = 1024 * 1024
+    ranges = [(i * mib, (i + 1) * mib - 1) for i in range(300)]
+
+    merged = dm._merge_ranges(ranges)
+
+    assert all(end - start + 1 <= MAX_RANGE_BYTES for start, end in merged)
+    assert all(cur[0] == prev[1] + 1 for prev, cur in zip(merged, merged[1:]))
+    assert merged[0][0] == 0
+    assert merged[-1][1] == 300 * mib - 1

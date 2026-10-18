@@ -53,6 +53,7 @@ from .packages import (
 
 
 DEFAULT_REQUEST_TIMEOUT = 30
+MAX_RANGE_BYTES = 64 * 1024 * 1024
 
 
 def _default_request_timeout(session: Any) -> None:
@@ -774,7 +775,11 @@ class DownloadManager:
             else:
                 merged.append((start, end))
 
-        return merged
+        return [
+            (piece_start, min(piece_start + MAX_RANGE_BYTES - 1, end))
+            for start, end in merged
+            for piece_start in range(start, end + 1, MAX_RANGE_BYTES)
+        ]
 
     def download_chunk(self, url: str, start: int, end: int, item: Any = None) -> bytes:
         """Download a specific byte range with retries and backoff."""
