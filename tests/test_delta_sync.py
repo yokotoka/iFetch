@@ -653,3 +653,24 @@ def test_sync_state_key_is_relative_posix(tmp_path):
     state = SyncState(tmp_path)
     nested = tmp_path / "a" / "b" / "c.bin"
     assert state.key_for(nested) == "a/b/c.bin"
+
+
+class EmptyListingNode(FakeNode):
+    """pyicloud maps a listed size of 0 to None; the raw listing keeps it."""
+
+    def __init__(self, name, listed_size):
+        super().__init__(name, size=0)
+        self.size = None
+        self.data = {"size": listed_size}
+
+
+def test_empty_remote_file_fast_skips_without_sync_state_entry(tmp_path, monkeypatch):
+    dm = _manager(tmp_path, monkeypatch)
+    empty = tmp_path / "empty.bin"
+    empty.write_bytes(b"")
+    one_byte = tmp_path / "one.bin"
+    one_byte.write_bytes(b"x")
+
+    assert dm._can_fast_skip(EmptyListingNode("empty.bin", 0), empty) is True
+    assert dm._can_fast_skip(EmptyListingNode("one.bin", 0), one_byte) is False
+    assert dm._can_fast_skip(EmptyListingNode("empty.bin", 5), empty) is False

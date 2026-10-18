@@ -1183,6 +1183,8 @@ class DownloadManager:
             return False
 
         remote_size, remote_token = remote_metadata(item)
+        if remote_size == 0 and local_path.is_file() and local_path.stat().st_size == 0:
+            return True
         if remote_size is None or not remote_token:
             return False
 
