@@ -845,6 +845,23 @@ def test_expired_url_410_is_retried():
     assert len(calls) == 3
 
 
+def test_retry_wait_is_capped_for_long_resumed_downloads(monkeypatch):
+    dl = make_downloader(FakeAPI(None), max_retries=30)
+    waits = []
+    monkeypatch.setattr("ifetch.photos.time.sleep", waits.append)
+    failures = iter(range(8))
+
+    def flaky():
+        if next(failures, None) is not None:
+            raise Exception("Connection broken: IncompleteRead(100 bytes read)")
+        return "done"
+
+    assert dl._with_retry(flaky, "asset") == "done"
+    assert waits[:2] == [2, 4]
+    assert len(waits) == 8
+    assert max(waits) <= 60
+
+
 def test_index_saved_when_enumeration_fails(tmp_path):
     assets = [FakeAsset(f"a{i}", f"{i}.jpg", dt(2024, 1, 2)) for i in range(3)]
     dl = make_downloader(
