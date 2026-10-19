@@ -11,6 +11,7 @@ No network access is performed.
 """
 
 import json
+import logging
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
@@ -771,6 +772,45 @@ def test_recently_deleted_only_included_behind_flag(tmp_path):
     api2 = FakeAPI(FakePhotosService([library, deleted], all_album=library))
     with_deleted = make_downloader(api2, folder_structure="flat", include_deleted=True)
     assert sorted(a.id for _, a in with_deleted.iter_assets()) == ["a1", "a9"]
+
+
+# ---------------------------------------------------------------------------
+# Shared albums
+# ---------------------------------------------------------------------------
+class FakeSharedLibrary:
+    def __init__(self, albums):
+        self.albums = ModernAlbumContainer(albums)
+
+
+def shared_api(*albums):
+    service = FakePhotosService(list(albums))
+    service.libraries = {"root": service, "shared": FakeSharedLibrary(albums)}
+    return FakeAPI(service)
+
+
+def test_shared_albums_download_into_album_folders(tmp_path):
+    trip = FakeAlbum("Trip", [FakeAsset("s1", "beach.jpg", dt(2024, 3, 1))])
+    family = FakeAlbum("Family", [FakeAsset("s2", "dinner.jpg", dt(2024, 4, 1))])
+    dl = make_downloader(shared_api(trip, family), folder_structure="album", shared_albums=True)
+
+    assert [(name, a.id) for name, a in dl.iter_assets()] == [("Trip", "s1"), ("Family", "s2")]
+
+    dl.download(destination=tmp_path)
+    assert (tmp_path / "Trip" / "beach.jpg").exists()
+    assert (tmp_path / "Family" / "dinner.jpg").exists()
+    assets = json.loads((tmp_path / INDEX_FILENAME).read_text())["assets"]
+    assert assets["s1"]["album"] == "Trip"
+
+
+def test_shared_albums_without_shared_library_yields_nothing(caplog):
+    api = FakeAPI(FakePhotosService([FakeAlbum("Library", [FakeAsset("a1", "one.jpg", dt(2024, 1, 2))])]))
+    api.photos.libraries = {"root": api.photos}
+    dl = make_downloader(api, shared_albums=True)
+    dl.logger = logging.getLogger("shared-albums-test")
+
+    with caplog.at_level(logging.WARNING, logger="shared-albums-test"):
+        assert list(dl.iter_assets()) == []
+    assert "shared_library_unavailable" in caplog.text
 
 
 # ---------------------------------------------------------------------------
