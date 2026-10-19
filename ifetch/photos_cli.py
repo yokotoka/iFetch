@@ -73,6 +73,13 @@ Examples:
         help='Album name to download (default: the whole library)'
     )
     parser.add_argument(
+        '--shared-albums',
+        dest='shared_albums',
+        action='store_true',
+        help='Download every Shared Album (shared streams from other people); '
+             'with --folder-structure album each lands in its own folder'
+    )
+    parser.add_argument(
         '--since',
         default=None,
         metavar='DATE',
@@ -146,7 +153,10 @@ Examples:
         help='Show what would be downloaded without writing any files'
     )
 
-    return parser.parse_args(argv)
+    args = parser.parse_args(argv)
+    if args.shared_albums and args.album:
+        parser.error('--shared-albums cannot be combined with --album')
+    return args
 
 
 def main(argv=None) -> int:
@@ -165,6 +175,7 @@ def main(argv=None) -> int:
             folder_structure=args.folder_structure,
             live_photos=args.live_photos,
             include_deleted=args.include_deleted,
+            shared_albums=args.shared_albums,
             dry_run=args.dry_run,
             set_mtime=args.set_mtime,
         )

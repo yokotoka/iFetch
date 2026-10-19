@@ -214,6 +214,7 @@ class PhotosDownloader:
         folder_structure: str = "date",
         live_photos: bool = False,
         include_deleted: bool = False,
+        shared_albums: bool = False,
         dry_run: bool = False,
         set_mtime: bool = True,
     ):
@@ -238,6 +239,7 @@ class PhotosDownloader:
         self.folder_structure = folder_structure
         self.live_photos = bool(live_photos)
         self.include_deleted = bool(include_deleted)
+        self.shared_albums = bool(shared_albums)
         self.dry_run = bool(dry_run)
         self.set_mtime = bool(set_mtime)
 
@@ -275,9 +277,9 @@ class PhotosDownloader:
     # ------------------------------------------------------------------
     # Albums
     # ------------------------------------------------------------------
-    def _album_objects(self) -> List[Any]:
+    def _album_objects(self, container: Any = None) -> List[Any]:
         """Return album objects across both pyicloud generations."""
-        container = self.photos_service.albums
+        container = self.photos_service.albums if container is None else container
         albums: List[Any] = []
         for item in container:
             if isinstance(item, str):
@@ -296,6 +298,14 @@ class PhotosDownloader:
             if isinstance(value, str) and value:
                 return value
         return str(album)
+
+    def _shared_album_objects(self) -> List[Any]:
+        """Return every Shared Album, or nothing when the account has none."""
+        shared = self.photos_service.libraries.get("shared")
+        if shared is None:
+            self.logger.warning(json.dumps({"event": "shared_library_unavailable"}))
+            return []
+        return self._album_objects(shared.albums)
 
     def list_albums(self) -> List[Dict[str, Any]]:
         """List every album with its (best-effort) asset count."""
@@ -372,8 +382,10 @@ class PhotosDownloader:
         until: Optional[datetime] = None,
     ) -> Iterator[Tuple[str, Any]]:
         """Yield ``(album_name, asset)`` pairs matching the selection."""
-        sources: List[Any] = [self.get_album(album)]
-        if self.include_deleted and not album:
+        sources: List[Any] = (
+            self._shared_album_objects() if self.shared_albums else [self.get_album(album)]
+        )
+        if self.include_deleted and not album and not self.shared_albums:
             try:
                 sources.append(self.get_album(RECENTLY_DELETED_ALBUM))
             except Exception as exc:
@@ -1013,7 +1025,7 @@ class PhotosDownloader:
             json.dumps(
                 {
                     "event": "photos_download_started",
-                    "album": album or "All Photos",
+                    "album": "Shared Albums" if self.shared_albums else album or "All Photos",
                     "destination": str(dest),
                     "version": self.version,
                     "folder_structure": self.folder_structure,
