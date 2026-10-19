@@ -636,6 +636,36 @@ def test_edited_render_downloaded_next_to_original(tmp_path):
     assert sorted(p.name for p in tmp_path.glob("IMG_0003*")) == ["IMG_0003.HEIC"]
 
 
+def test_date_prefix_applies_to_photo_live_and_edited_names(tmp_path):
+    def build():
+        asset = FakeAsset(
+            "a1", "IMG_0001.HEIC", dt(2023, 7, 14), data=b"still",
+            live_data=b"movie", edited_data=b"edit",
+        )
+        return FakeAPI(FakePhotosService([FakeAlbum("Library", [asset])]))
+
+    plain = tmp_path / "plain"
+    make_downloader(build(), folder_structure="flat", live_photos=True).download(destination=plain)
+    assert sorted(p.name for p in plain.glob("*IMG_0001*")) == [
+        "IMG_0001.HEIC", "IMG_0001.MOV", "IMG_0001_edited.JPG",
+    ]
+
+    prefixed = tmp_path / "prefixed"
+    make_downloader(
+        build(), folder_structure="flat", live_photos=True, date_prefix=True
+    ).download(destination=prefixed)
+
+    assert sorted(p.name for p in prefixed.glob("*IMG_0001*")) == [
+        "2023-07-14 IMG_0001.HEIC",
+        "2023-07-14 IMG_0001.MOV",
+        "2023-07-14 IMG_0001_edited.JPG",
+    ]
+    entry = json.loads((prefixed / INDEX_FILENAME).read_text())["assets"]["a1"]
+    assert entry["path"] == "2023-07-14 IMG_0001.HEIC"
+    assert entry["live_path"] == "2023-07-14 IMG_0001.MOV"
+    assert entry["edited_path"] == "2023-07-14 IMG_0001_edited.JPG"
+
+
 def test_edited_render_fetched_for_already_downloaded_asset(tmp_path):
     def build(edited_data):
         asset = FakeAsset("a1", "one.jpg", dt(2024, 1, 2), data=b"orig", edited_data=edited_data)

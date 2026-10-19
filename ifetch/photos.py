@@ -213,6 +213,7 @@ class PhotosDownloader:
         version: str = "original",
         folder_structure: str = "date",
         live_photos: bool = False,
+        date_prefix: bool = False,
         include_deleted: bool = False,
         shared_albums: bool = False,
         dry_run: bool = False,
@@ -238,6 +239,7 @@ class PhotosDownloader:
         self.version = version
         self.folder_structure = folder_structure
         self.live_photos = bool(live_photos)
+        self.date_prefix = bool(date_prefix)
         self.include_deleted = bool(include_deleted)
         self.shared_albums = bool(shared_albums)
         self.dry_run = bool(dry_run)
@@ -624,6 +626,9 @@ class PhotosDownloader:
 
         raw_name = version_info.get("filename") or getattr(asset, "filename", None) or asset_id
         filename = sanitize_filename(raw_name)
+        if self.date_prefix:
+            stamp = created or datetime.fromtimestamp(0, timezone.utc)
+            filename = f"{stamp:%Y-%m-%d} {filename}"
 
         size = version_info.get("size")
         if size is None:
