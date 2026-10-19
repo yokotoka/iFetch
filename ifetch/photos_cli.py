@@ -112,6 +112,12 @@ Examples:
         help='Also download the paired video component of Live Photos'
     )
     parser.add_argument(
+        '--date-prefix',
+        dest='date_prefix',
+        action='store_true',
+        help='Prepend the capture date (YYYY-MM-DD) to every downloaded filename'
+    )
+    parser.add_argument(
         '--include-deleted',
         dest='include_deleted',
         action='store_true',
@@ -174,6 +180,7 @@ def main(argv=None) -> int:
             version=args.version,
             folder_structure=args.folder_structure,
             live_photos=args.live_photos,
+            date_prefix=args.date_prefix,
             include_deleted=args.include_deleted,
             shared_albums=args.shared_albums,
             dry_run=args.dry_run,
