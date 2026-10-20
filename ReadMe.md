@@ -838,6 +838,14 @@ Common issues — the 2FA flow, expired sessions, per-OS keyring problems, rate 
 
 `ifetch uplink` is not a step toward it, and is designed so it cannot become one. It answers a single question — *iCloud lost these files and I still have them* — by uploading only what iCloud does not have. There is no code path in it that overwrites, deletes or renames a remote file. It also refuses outright when the evidence is weak: that second question above, "deleted or just not listed?", is exactly why a scan that recorded listing errors refuses the whole run rather than uploading anything, since a failed listing makes every local file look missing and would otherwise push the entire mirror back into the account.
 
+## TODO
+
+- **GUI for a full iCloud backup driven by ifetch**: live progress for Drive and every photo pass (library, Hidden, Recently Deleted, Shared Albums) read from local copies of the indexes (never opening them in place on a busy external disk), start/stop of the scheduled job, a list of failures with their errors, and a browser for the hidden album.
+- Shared-stream photo URLs cannot be refreshed on retry (legacy `PhotoStreamAsset` has no CloudKit library client).
+- Drive files whose content is a JSON object fail to download (pyicloud parses the body as an API response, "Unknown reason: {...}").
+- RAW+JPEG alternative originals (`resOriginalAltRes`) are not downloaded.
+- `--list-albums` does not list shared albums.
+
 ## Contributing
 
 Contributions are welcome — bug reports, docs, and PRs alike. Please open an issue to discuss larger changes first, and make sure `pytest` passes.
