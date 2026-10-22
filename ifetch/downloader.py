@@ -56,18 +56,27 @@ DEFAULT_REQUEST_TIMEOUT = 30
 MAX_RANGE_BYTES = 64 * 1024 * 1024
 
 
-def _default_request_timeout(session: Any) -> None:
-    """Make requests that name no timeout (pyicloud's own calls) time out."""
+def _patch_session_requests(session: Any) -> None:
+    """Give pyicloud's requests a default timeout and keep file bodies unparsed.
+
+    pyicloud parses every JSON-typed response as an API reply, so a downloaded
+    ``.json`` file raises "Unknown reason". Streamed requests are file
+    downloads, so they go through ``request_raw`` instead.
+    """
     if session is None:
         return
     request = session.request
 
-    def request_with_timeout(*args: Any, **kwargs: Any) -> Any:
+    def patched_request(*args: Any, **kwargs: Any) -> Any:
         if kwargs.get("timeout") is None:
             kwargs["timeout"] = DEFAULT_REQUEST_TIMEOUT
-        return request(*args, **kwargs)
+        if not kwargs.get("stream"):
+            return request(*args, **kwargs)
+        response = session.request_raw(*args, **kwargs)
+        response.raise_for_status()
+        return response
 
-    session.request = request_with_timeout
+    session.request = patched_request
 
 
 def remote_metadata(item: Any) -> Tuple[Optional[int], Optional[str]]:
@@ -547,7 +556,7 @@ class DownloadManager:
             params.update(region_service_kwargs(self.region))
 
             self.api = PyiCloudService(**params)
-            _default_request_timeout(getattr(self.api, "session", None))
+            _patch_session_requests(getattr(self.api, "session", None))
 
             if self.api.requires_2fa:
                 print("\nTwo-factor authentication required.")

@@ -4,7 +4,10 @@ from pathlib import Path
 
 sys.path.append(str(Path(__file__).resolve().parents[1]))
 
-from ifetch.downloader import DownloadManager  # noqa: E402
+import pytest
+import requests
+
+from ifetch.downloader import DownloadManager, _patch_session_requests  # noqa: E402
 from ifetch.models import DownloadStatus  # noqa: E402
 
 
@@ -206,3 +209,43 @@ def test_download_writes_report_and_dispatches_completion(monkeypatch, tmp_path)
     payload = json.loads(report_path.read_text())
     assert payload["summary"]["successful"] == 1
     assert any(kwargs.get("name") == "download_session_completed" for _, kwargs in dispatched)
+
+
+class _FakeSession:
+    def __init__(self, status=200):
+        self.calls = []
+        self.status = status
+
+    def request(self, method, url, **kwargs):
+        self.calls.append(("request", url, kwargs))
+        return "parsed"
+
+    def request_raw(self, method, url, **kwargs):
+        self.calls.append(("raw", url, kwargs))
+        status = self.status
+
+        class Response:
+            def raise_for_status(self):
+                if status >= 400:
+                    raise requests.HTTPError(f"{status} Client Error")
+
+        return Response()
+
+
+def test_streamed_downloads_bypass_pyicloud_json_parsing():
+    session = _FakeSession()
+    _patch_session_requests(session)
+
+    assert session.request("GET", "https://api.example/list") == "parsed"
+    session.request("GET", "https://content.example/vocab.json", stream=True)
+
+    assert [call[0] for call in session.calls] == ["request", "raw"]
+    assert session.calls[1][2]["timeout"] == 30
+
+
+def test_streamed_download_error_status_still_raises():
+    session = _FakeSession(status=404)
+    _patch_session_requests(session)
+
+    with pytest.raises(requests.HTTPError):
+        session.request("GET", "https://content.example/gone", stream=True)
