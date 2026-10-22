@@ -65,6 +65,9 @@ class FakeAsset:
         edited_data=None,
         edited_type="public.jpeg",
         original_type="public.jpeg",
+        render_data=None,
+        poster_data=None,
+        edited_live_data=None,
     ):
         self.id = asset_id
         self.filename = filename
@@ -116,16 +119,26 @@ class FakeAsset:
                 }
             }
 
+        def field(prefix, data, file_type):
+            url = f"https://example.invalid/{asset_id}/{prefix}"
+            self.urls[url] = data
+            return {
+                prefix + "Res": {"value": {"downloadURL": url, "size": len(data)}},
+                prefix + "FileType": {"value": file_type},
+            }
+
+        asset_fields = {}
         if edited_data is not None:
             prefix = "resVidFull" if original_type == "com.apple.quicktime-movie" else "resJPEGFull"
-            url = f"https://example.invalid/{asset_id}/edited"
-            self.urls[url] = edited_data
-            self.asset_record = {
-                "fields": {
-                    prefix + "Res": {"value": {"downloadURL": url, "size": len(edited_data)}},
-                    prefix + "FileType": {"value": edited_type},
-                }
-            }
+            asset_fields.update(field(prefix, edited_data, edited_type))
+        if poster_data is not None:
+            asset_fields.update(field("resJPEGFull", poster_data, "public.jpeg"))
+        if edited_live_data is not None:
+            asset_fields.update(field("resVidCompl", edited_live_data, "com.apple.quicktime-movie"))
+        if asset_fields:
+            self.asset_record = {"fields": asset_fields}
+        if render_data is not None:
+            self.master_record = {"fields": field("resJPEGFull", render_data, "public.jpeg")}
 
     def download_url(self, version="original"):
         self.download_calls.append(version)
@@ -684,6 +697,82 @@ def test_edited_render_fetched_for_already_downloaded_asset(tmp_path):
     asset3, api3 = build(b"edit")
     again = make_downloader(api3, folder_structure="flat").download(destination=tmp_path)
     assert again["summary"]["skipped"] == 1
+
+
+def test_raw_master_render_downloaded_and_recorded(tmp_path):
+    def build():
+        raw = FakeAsset(
+            "a1", "IMG_0001.DNG", dt(2024, 1, 2), data=b"raw",
+            original_type="com.adobe.raw-image", render_data=b"jpeg-render",
+        )
+        return raw, FakeAPI(FakePhotosService([FakeAlbum("Library", [raw])]))
+
+    make_downloader(build()[1], folder_structure="flat").download(destination=tmp_path)
+
+    assert (tmp_path / "IMG_0001_render.JPG").read_bytes() == b"jpeg-render"
+    entry = json.loads((tmp_path / INDEX_FILENAME).read_text())["assets"]["a1"]
+    assert (entry["render_path"], entry["render_size"]) == ("IMG_0001_render.JPG", len(b"jpeg-render"))
+
+    again = make_downloader(build()[1], folder_structure="flat").download(destination=tmp_path)
+    assert again["summary"]["skipped"] == 1
+
+
+def test_edited_video_poster_and_edited_live_video_downloaded(tmp_path):
+    video = FakeAsset(
+        "a1", "MOV_0001.MOV", dt(2024, 1, 2), data=b"orig", edited_data=b"cut", poster_data=b"poster",
+        edited_type="com.apple.quicktime-movie", original_type="com.apple.quicktime-movie",
+    )
+    live = FakeAsset(
+        "a2", "IMG_0002.HEIC", dt(2024, 1, 2), data=b"orig", edited_data=b"edit", edited_live_data=b"edit-movie",
+    )
+    photo_edit = FakeAsset("a3", "IMG_0003.HEIC", dt(2024, 1, 2), data=b"orig", edited_data=b"edit")
+    api = FakeAPI(FakePhotosService([FakeAlbum("Library", [video, live, photo_edit])]))
+
+    make_downloader(api, folder_structure="flat").download(destination=tmp_path)
+
+    assert (tmp_path / "MOV_0001_edited.MOV").read_bytes() == b"cut"
+    assert (tmp_path / "MOV_0001_edited_poster.JPG").read_bytes() == b"poster"
+    assert (tmp_path / "IMG_0002_edited_live.MOV").read_bytes() == b"edit-movie"
+    assert sorted(p.name for p in tmp_path.glob("IMG_0003*")) == ["IMG_0003.HEIC", "IMG_0003_edited.JPG"]
+    entries = json.loads((tmp_path / INDEX_FILENAME).read_text())["assets"]
+    assert entries["a1"]["edited_poster_size"] == len(b"poster")
+    assert entries["a2"]["edited_live_path"] == "IMG_0002_edited_live.MOV"
+
+
+def test_extra_components_follow_date_prefix(tmp_path):
+    raw = FakeAsset(
+        "a1", "IMG_0001.DNG", dt(2023, 7, 14), data=b"raw",
+        original_type="com.adobe.raw-image", render_data=b"jpeg-render",
+    )
+    api = FakeAPI(FakePhotosService([FakeAlbum("Library", [raw])]))
+
+    make_downloader(api, folder_structure="flat", date_prefix=True).download(destination=tmp_path)
+
+    assert (tmp_path / "2023-07-14 IMG_0001_render.JPG").exists()
+
+
+def test_component_sizes_recorded_and_backfilled_without_download(tmp_path):
+    def build():
+        asset = FakeAsset(
+            "a1", "one.jpg", dt(2024, 1, 2), data=b"orig", live_data=b"movie", edited_data=b"edit"
+        )
+        return asset, FakeAPI(FakePhotosService([FakeAlbum("Library", [asset])]))
+
+    make_downloader(build()[1], folder_structure="flat", live_photos=True).download(destination=tmp_path)
+    index_file = tmp_path / INDEX_FILENAME
+    index = json.loads(index_file.read_text())
+    entry = index["assets"]["a1"]
+    assert (entry["live_size"], entry["edited_size"]) == (len(b"movie"), len(b"edit"))
+
+    del entry["live_size"], entry["edited_size"]
+    index_file.write_text(json.dumps(index))
+    asset, api = build()
+    report = make_downloader(api, folder_structure="flat", live_photos=True).download(destination=tmp_path)
+
+    assert asset.download_calls == []
+    assert report["summary"]["skipped"] == 1
+    entry = json.loads(index_file.read_text())["assets"]["a1"]
+    assert (entry["live_size"], entry["edited_size"]) == (len(b"movie"), len(b"edit"))
 
 
 # ---------------------------------------------------------------------------
