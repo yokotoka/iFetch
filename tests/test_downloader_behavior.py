@@ -206,3 +206,52 @@ def test_download_writes_report_and_dispatches_completion(monkeypatch, tmp_path)
     payload = json.loads(report_path.read_text())
     assert payload["summary"]["successful"] == 1
     assert any(kwargs.get("name") == "download_session_completed" for _, kwargs in dispatched)
+
+
+class _AppLibraryDrive:
+    def __init__(self, libraries, details):
+        self._libraries, self._details = libraries, details
+
+    def get_app_data(self):
+        return self._libraries
+
+    def get_node_data(self, drivewsid):
+        detail = self._details[drivewsid]
+        if isinstance(detail, Exception):
+            raise detail
+        return detail
+
+
+class _RootNode:
+    def __init__(self, visible):
+        self._visible = visible
+
+    def get_children(self):
+        return [type("Child", (), {"data": {"drivewsid": drivewsid}})() for drivewsid in self._visible]
+
+    def dir(self):
+        return ["Pages"]
+
+
+def test_app_libraries_missing_from_root_are_walked(monkeypatch, tmp_path):
+    from pyicloud.exceptions import PyiCloudAPIResponseException
+
+    library = lambda drivewsid, name: {"drivewsid": drivewsid, "name": name, "type": "APP_LIBRARY"}
+    drive = _AppLibraryDrive(
+        [library("pages", "Pages"), library("books", "Books"), library("empty", "Empty"), library("gone", "Gone")],
+        {
+            "books": {"drivewsid": "books", "name": "Books", "type": "APP_LIBRARY", "items": [{"name": "a"}]},
+            "empty": {"drivewsid": "empty", "name": "Empty", "type": "APP_LIBRARY", "items": []},
+            "gone": PyiCloudAPIResponseException("ZONE_NOT_FOUND", 502),
+        },
+    )
+    dm = DownloadManager(email="user@example.com")
+    dm.api = type("API", (), {"drive": drive})()
+    walked = []
+    monkeypatch.setattr(
+        dm, "process_item_parallel", lambda item, local_path, remote_path=None: walked.append((item.name, local_path, remote_path))
+    )
+
+    dm._submit_missing_app_libraries(_RootNode(visible=["pages"]), tmp_path)
+
+    assert walked == [("Books", tmp_path / "Books", "Books")]
