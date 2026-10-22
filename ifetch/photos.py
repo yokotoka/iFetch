@@ -70,6 +70,14 @@ VERSION_FALLBACKS = ("original", "medium", "thumb")
 #: Version keys that hold the video half of a Live Photo, best first.
 LIVE_VERSION_KEYS = ("original_video", "medium_video", "thumb_video", "live")
 
+#: Files stored next to the original, read from the raw CloudKit records:
+#: index key, record, field prefix, filename suffix, default extension, videos only.
+EXTRA_COMPONENTS = (
+    ("render_path", "master_record", "resJPEGFull", "_render", ".JPG", False),
+    ("edited_poster_path", "asset_record", "resJPEGFull", "_edited_poster", ".JPG", True),
+    ("edited_live_path", "asset_record", "resVidCompl", "_edited_live", ".MOV", False),
+)
+
 #: Album name pyicloud uses for the recently-deleted smart album.
 RECENTLY_DELETED_ALBUM = "Recently Deleted"
 
@@ -132,6 +140,14 @@ def sanitize_filename(name: str) -> str:
 
 
 @dataclass
+class Extra:
+    """One extra component file of an asset."""
+
+    path: Path
+    url: str
+
+
+@dataclass
 class AssetPlan:
     """A resolved decision about one asset, made before any download starts."""
 
@@ -147,6 +163,8 @@ class AssetPlan:
     live_url: Optional[str] = None
     edited_path: Optional[Path] = None
     edited_url: Optional[str] = None
+    extras: Dict[str, Extra] = field(default_factory=dict)
+    sizes: Dict[str, int] = field(default_factory=dict)
     need_photo: bool = True
     skipped: bool = False
     skip_reason: str = ""
@@ -155,7 +173,9 @@ class AssetPlan:
 
     @property
     def needs_work(self) -> bool:
-        return self.need_photo or self.live_path is not None or self.edited_path is not None
+        return (
+            self.need_photo or self.live_path is not None or self.edited_path is not None or bool(self.extras)
+        )
 
 
 @dataclass
@@ -492,8 +512,20 @@ class PhotosDownloader:
                     return "original_video", url, None
         return None, None, None
 
-    def _edited_component(self, asset: Any) -> Tuple[Optional[str], Optional[str]]:
-        """Return ``(url, extension)`` for the edited render, if the asset has one.
+    def _is_video(self, asset: Any) -> bool:
+        original_type = (self._asset_versions(asset).get("original") or {}).get("type")
+        return PhotoAsset.ITEM_TYPES.get(original_type) == "movie"
+
+    @staticmethod
+    def _record_component(record: Any, prefix: str) -> Tuple[Optional[str], Optional[str], Optional[int]]:
+        """Return ``(url, extension, size)`` of a raw record's ``<prefix>Res`` field."""
+        token = record_field_value(record, prefix + "Res")
+        read = token.get if isinstance(token, dict) else lambda name: getattr(token, name, None)
+        extension = PhotoAsset.FILE_TYPE_EXTENSIONS.get(record_field_value(record, prefix + "FileType"))
+        return read("downloadURL"), extension, read("size")
+
+    def _edited_component(self, asset: Any) -> Tuple[Optional[str], Optional[str], Optional[int]]:
+        """Return ``(url, extension, size)`` for the edited render, if the asset has one.
 
         pyicloud does not expose edits in ``versions``; they are the
         ``resJPEGFull`` (photo) or ``resVidFull`` (video) fields of the raw
@@ -501,14 +533,20 @@ class PhotosDownloader:
         """
         record = getattr(asset, "asset_record", None)
         if record is None:
-            return None, None
-        original_type = (self._asset_versions(asset).get("original") or {}).get("type")
-        prefix = "resVidFull" if PhotoAsset.ITEM_TYPES.get(original_type) == "movie" else "resJPEGFull"
-        token = record_field_value(record, prefix + "Res")
-        url = token.get("downloadURL") if isinstance(token, dict) else getattr(token, "downloadURL", None)
-        if not url:
-            return None, None
-        return url, PhotoAsset.FILE_TYPE_EXTENSIONS.get(record_field_value(record, prefix + "FileType"))
+            return None, None, None
+        return self._record_component(record, "resVidFull" if self._is_video(asset) else "resJPEGFull")
+
+    def _extra_components(self, asset: Any) -> Dict[str, Tuple[str, str, Optional[str], Optional[int]]]:
+        """Return ``{index key: (filename suffix, url, extension, size)}`` for the extra files."""
+        components = {}
+        for key, holder, prefix, suffix, default_extension, video_only in EXTRA_COMPONENTS:
+            record = getattr(asset, holder, None)
+            if record is None or (video_only and not self._is_video(asset)):
+                continue
+            url, extension, size = self._record_component(record, prefix)
+            if url:
+                components[key] = (suffix, url, extension or default_extension, size)
+        return components
 
     @staticmethod
     def _live_filename(photo_name: str, version_filename: Optional[str]) -> str:
@@ -672,8 +710,9 @@ class PhotosDownloader:
                 )
                 plan.live_version = live_version
                 plan.live_url = live_url
+                plan.sizes["live_path"] = (versions.get(live_version) or {}).get("size")
 
-        edited_url, edited_ext = self._edited_component(asset)
+        edited_url, edited_ext, edited_size = self._edited_component(asset)
         if edited_url:
             edited_candidate = local_path.with_name(
                 local_path.stem + "_edited" + (edited_ext or local_path.suffix)
@@ -685,6 +724,15 @@ class PhotosDownloader:
                 claimed, edited_candidate, asset_id + ":edited", owned_edited
             )
             plan.edited_url = edited_url
+            plan.sizes["edited_path"] = edited_size
+
+        for key, (suffix, url, extension, extra_size) in self._extra_components(asset).items():
+            owned_extra = str(destination / entry[key]) if entry and entry.get(key) else None
+            extra_path = self._claim_path(
+                claimed, local_path.with_name(local_path.stem + suffix + extension), f"{asset_id}:{key}", owned_extra
+            )
+            plan.extras[key] = Extra(extra_path, url)
+            plan.sizes[key] = extra_size
 
         # Skip decision -------------------------------------------------
         if entry and entry.get("version") == version:
@@ -706,11 +754,23 @@ class PhotosDownloader:
                     edited_recorded = entry.get("edited_path")
                     if edited_recorded and (destination / edited_recorded).exists():
                         plan.edited_path = None
-                if plan.live_path is None and plan.edited_path is None:
+                for key in list(plan.extras):
+                    if entry.get(key) and (destination / entry[key]).exists():
+                        del plan.extras[key]
+                self._backfill_sizes(entry, plan, destination)
+                if plan.live_path is None and plan.edited_path is None and not plan.extras:
                     plan.skipped = True
                     plan.skip_reason = "already_downloaded"
 
         return plan
+
+    def _backfill_sizes(self, entry: Dict[str, Any], plan: AssetPlan, destination: Path) -> None:
+        """Record the size of components stored before sizes were indexed."""
+        with self._results_lock:
+            for key, size in plan.sizes.items():
+                size_key = key.replace("_path", "_size")
+                if size is not None and entry.get(key) and (destination / entry[key]).exists():
+                    entry.setdefault(size_key, size)
 
     # ------------------------------------------------------------------
     # Retry / transport
@@ -864,6 +924,16 @@ class PhotosDownloader:
             f"{plan.edited_path.name} (edited)",
         )
 
+    def _download_extra(self, plan: AssetPlan, key: str) -> int:
+        """Fetch one extra component of an asset."""
+        extra = plan.extras[key]
+        return self._download_url(
+            plan,
+            extra.path,
+            lambda asset: (self._extra_components(asset).get(key) or (None, None))[1] or extra.url,
+            f"{extra.path.name} ({key})",
+        )
+
     # ------------------------------------------------------------------
     # Execution
     # ------------------------------------------------------------------
@@ -889,6 +959,10 @@ class PhotosDownloader:
                 downloaded += self._download_edited(plan)
                 self._apply_mtime(plan.edited_path, plan.created)
 
+            for key, extra in plan.extras.items():
+                downloaded += self._download_extra(plan, key)
+                self._apply_mtime(extra.path, plan.created)
+
             self._record(
                 DownloadStatus(
                     path=str(plan.local_path),
@@ -906,6 +980,7 @@ class PhotosDownloader:
                         "version": plan.version,
                         "live_path": str(plan.live_path) if plan.live_path else None,
                         "edited_path": str(plan.edited_path) if plan.edited_path else None,
+                        "extra_paths": {key: str(extra.path) for key, extra in plan.extras.items()},
                         "bytes": downloaded,
                     }
                 )
@@ -962,12 +1037,18 @@ class PhotosDownloader:
             "album": plan.album,
             "downloaded_at": datetime.now(timezone.utc).isoformat(),
         }
-        for key, planned in (("live_path", plan.live_path), ("edited_path", plan.edited_path)):
+        planned_paths = {"live_path": plan.live_path, "edited_path": plan.edited_path}
+        planned_paths.update((key, extra.path) for key, extra in plan.extras.items())
+        for key, planned in planned_paths.items():
             recorded = planned or (
                 self.root_path / existing[key] if existing.get(key) and self.root_path else None
             )
-            if recorded is not None:
-                entry[key] = self._relative(Path(recorded))
+            if recorded is None:
+                continue
+            entry[key] = self._relative(Path(recorded))
+            component_size = plan.sizes.get(key) or existing.get(key.replace("_path", "_size"))
+            if component_size is not None:
+                entry[key.replace("_path", "_size")] = component_size
         with self._results_lock:
             self.index.record(plan.asset_id, entry)
 
