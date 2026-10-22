@@ -12,7 +12,9 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 import requests
 from requests.adapters import HTTPAdapter
 from pyicloud import PyiCloudService
+from pyicloud.services.drive import DriveNode
 from pyicloud.exceptions import (
+    PyiCloudException,
     PyiCloudFailedLoginException,
     PyiCloudNoStoredPasswordAvailableException
 )
@@ -2065,6 +2067,34 @@ class DownloadManager:
             if self._pending == 0:
                 self._traversal_done.set()
 
+    def _submit_missing_app_libraries(self, root: Any, local_root: Path) -> None:
+        """Queue app libraries that Apple's root listing leaves out.
+
+        They are readable like the visible ones; libraries whose zone cannot be
+        read (or that are empty) are skipped.
+        """
+        visible = {child.data["drivewsid"] for child in root.get_children()}
+        sanitizer = DirectorySanitizer(portable=self.portable_names, normalize=self.normalize_names)
+        for name in root.dir():
+            sanitizer.assign(name)
+        for library in self.api.drive.get_app_data():
+            if library["drivewsid"] not in visible:
+                library.setdefault("name", library["drivewsid"])
+                local_name, _ = sanitizer.assign(library["name"])
+                self._submit_task(self._walk_app_library, library, local_root / local_name)
+
+    def _walk_app_library(self, library: Dict[str, Any], local_path: Path) -> None:
+        try:
+            details = self.api.drive.get_node_data(library["drivewsid"])
+        except PyiCloudException as exc:
+            self.logger.info(json.dumps({
+                "event": "app_library_unreadable", "library": library["name"], "error": str(exc),
+            }))
+            return
+        if details.get("items"):
+            node = DriveNode(self.api.drive, {**library, **details})
+            self.process_item_parallel(node, local_path, library["name"])
+
     def process_item_parallel(
         self,
         item: Any,
@@ -2327,6 +2357,8 @@ class DownloadManager:
         try:
             with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
                 self._executor = executor
+                if remote_path is None:
+                    self._submit_task(self._submit_missing_app_libraries, item, local_path_obj)
                 self._submit(item, local_path_obj, remote_path=remote_path)
                 self._traversal_done.wait()
             self._executor = None
